@@ -29,6 +29,7 @@ Created 25/5/2010 Sunny Bains
 #include "univ.i"
 #include <mysql/service_thd_wait.h>
 #include <mysql/service_wsrep.h>
+#include <wsrep.h>
 
 #include "srv0mon.h"
 #include "que0que.h"
@@ -36,6 +37,7 @@ Created 25/5/2010 Sunny Bains
 #include "row0mysql.h"
 #include "srv0start.h"
 #include "lock0priv.h"
+#include "log.h"
 
 /*********************************************************************//**
 Print the contents of the lock_sys_t::waiting_threads array. */
@@ -184,37 +186,36 @@ lock_wait_table_reserve_slot(
 check if lock timeout was for priority thread,
 as a side effect trigger lock monitor
 @param[in]    trx    transaction owning the lock
-@param[in]    locked true if trx and lock_sys.mutex is ownd
 @return	false for regular lock timeout */
 static
 bool
-wsrep_is_BF_lock_timeout(
-	const trx_t*	trx,
-	bool		locked = true)
+wsrep_is_BF_lock_timeout(trx_t*	trx)
 {
 	bool long_wait= (trx->error_state != DB_DEADLOCK &&
 			 trx->is_wsrep() &&
 			 wsrep_thd_is_BF(trx->mysql_thd, false));
 	bool was_wait= true;
 
+	ut_ad(lock_mutex_own());
+	ut_ad(trx_mutex_own(trx));
+
 	DBUG_EXECUTE_IF("wsrep_instrument_BF_lock_wait",
 			was_wait=false; long_wait=true;);
 
 	if (long_wait) {
-		ib::info() << "WSREP: BF lock wait long for trx:" << trx->id
-			   << " query: " << wsrep_thd_query(trx->mysql_thd);
+		WSREP_INFO("WSREP: BF lock wait long for trx: " TRX_ID_FMT
+			   " query: ",
+			   trx->id,
+			   wsrep_thd_query(trx->mysql_thd));
 
-		if (!locked)
-			lock_mutex_enter();
+		trx_print_latched(stdout, trx, 0);
 
-		ut_ad(lock_mutex_own());
-
-		trx_print_latched(stderr, trx, 3000);
-		/* Note this will release lock_sys mutex */
-		lock_print_info_all_transactions(stderr);
-
-		if (locked)
-			lock_mutex_enter();
+		/* Below function will use trx_mutex so release
+		it. Furthermore, function will release lock mutex. */
+		trx_mutex_exit(trx);
+		lock_print_info_all_transactions(stdout);
+		lock_mutex_enter();
+		trx_mutex_enter(trx);
 
 		return was_wait;
 	} else
@@ -401,17 +402,31 @@ lock_wait_suspend_thread(
 	}
 
 	if (lock_wait_timeout < 100000000
-	    && wait_time > (double) lock_wait_timeout
+	    && wait_time > (double) lock_wait_timeout)
+	{
 #ifdef WITH_WSREP
-	    && (!trx->is_wsrep()
-		|| (!wsrep_is_BF_lock_timeout(trx, false)
-		    && trx->error_state != DB_DEADLOCK))
+		if (!trx->is_wsrep())
 #endif /* WITH_WSREP */
-	    ) {
+		{
+			trx->error_state = DB_LOCK_WAIT_TIMEOUT;
 
-		trx->error_state = DB_LOCK_WAIT_TIMEOUT;
+			MONITOR_INC(MONITOR_TIMEOUT);
+		}
+#ifdef WITH_WSREP
+		else
+		{
+			lock_mutex_enter();
+			trx_mutex_enter(trx);
+			if (!wsrep_is_BF_lock_timeout(trx)) {
 
-		MONITOR_INC(MONITOR_TIMEOUT);
+				trx->error_state = DB_LOCK_WAIT_TIMEOUT;
+
+				MONITOR_INC(MONITOR_TIMEOUT);
+			}
+			trx_mutex_exit(trx);
+			lock_mutex_exit();
+		}
+#endif /* WITH_WSREP */
 	}
 
 	if (trx_is_interrupted(trx)) {
