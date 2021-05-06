@@ -18910,33 +18910,40 @@ static void bg_wsrep_kill_trx(
 	THD *thd 		   = find_thread_by_id(arg->thd_id, false);
 	trx_t *victim_trx 	   = NULL;
 	bool awake 		   = false;
+	enum wsrep_status rcode= WSREP_OK;
+
 	DBUG_ENTER("bg_wsrep_kill_trx");
 
-	if (thd) {
-		wsrep_thd_LOCK(thd);
-		victim_trx= thd_to_trx(thd);
-		/* Victim trx might not exist e.g. on MDL-conflict. */
-		if (victim_trx) {
-			lock_mutex_enter();
-			trx_mutex_enter(victim_trx);
-			if (victim_trx->id != arg->trx_id ||
-			    victim_trx->state == TRX_STATE_COMMITTED_IN_MEMORY)
-			{
-				/* Victim was meanwhile rolled back or
-				committed */
-				lock_mutex_exit();
-				trx_mutex_exit(victim_trx);
-				goto no_victim;
-			}
-		} else {
-no_victim:
-			wsrep_thd_UNLOCK(thd);
-			/* find_thread_by_id() acquired THD::LOCK_kill_data */
-			wsrep_thd_kill_UNLOCK(thd);
-			goto ret;
+	if (!thd)
+		goto ret; // Victim was already killed or disconnected
+
+	wsrep_thd_LOCK(thd);
+	victim_trx= thd_to_trx(thd);
+
+	if (victim_trx) {
+		lock_mutex_enter();
+		trx_mutex_enter(victim_trx);
+		if (victim_trx->id != arg->trx_id ||
+		    victim_trx->state == TRX_STATE_COMMITTED_IN_MEMORY)
+		{
+			/* Victim was meanwhile rolled back or
+			committed */
+			lock_mutex_exit();
+			trx_mutex_exit(victim_trx);
+			goto no_victim;
 		}
+	} else {
+no_victim:
+		/* Victim trx might not exist (MDL-conflict) or victim
+		was meanwhile rolled back or committed because of
+		a KILL statement or a disconnect. */
 		wsrep_thd_UNLOCK(thd);
+		/* find_thread_by_id() acquired THD::LOCK_thd_kill */
+		wsrep_thd_kill_UNLOCK(thd);
+		goto ret;
 	}
+
+	wsrep_thd_UNLOCK(thd);
 
 	WSREP_DEBUG("BF kill (" ULINTPF ", seqno: " INT64PF
 		    "), victim: (%lu) trx: " TRX_ID_FMT,
@@ -18958,7 +18965,7 @@ no_victim:
 	if (wsrep_thd_exec_mode(thd) != LOCAL_STATE) {
 		WSREP_DEBUG("withdraw for BF trx: " TRX_ID_FMT ", state: %d",
 			    victim_trx->id,
-		wsrep_thd_get_conflict_state(thd));
+			    wsrep_thd_get_conflict_state(thd));
 	}
 
 	switch (wsrep_thd_get_conflict_state(thd)) {
@@ -18979,8 +18986,6 @@ no_victim:
 
 	switch (wsrep_thd_query_state(thd)) {
 	case QUERY_COMMITTING:
-		enum wsrep_status rcode;
-
 		WSREP_DEBUG("kill query for: %ld",
 			    thd_get_thread_id(thd));
 		WSREP_DEBUG("kill trx QUERY_COMMITTING for " TRX_ID_FMT,
@@ -18991,29 +18996,42 @@ no_victim:
 					      wsrep_thd_trx_seqno(thd));
 		} else {
 			wsrep_t *wsrep= get_wsrep();
-			rcode = wsrep->abort_pre_commit(
-				wsrep, arg->bf_seqno,
-				(wsrep_trx_id_t)wsrep_thd_ws_handle(thd)->trx_id
-			);
+			wsrep_ws_handle_t* wsrep_handle= wsrep_thd_ws_handle(thd);
 
-			switch (rcode) {
-			case WSREP_WARNING:
-				WSREP_DEBUG("cancel commit warning: "
-					    TRX_ID_FMT,
-					    victim_trx->id);
-				goto ret_awake;
-			case WSREP_OK:
-				break;
-			default:
-				WSREP_ERROR(
-					"cancel commit bad exit: %d "
-					TRX_ID_FMT,
-					rcode, victim_trx->id);
-				/* unable to interrupt, must abort */
-				/* note: kill_mysql() will block, if we cannot.
-				 * kill the lock holder first.
-				 */
-				abort();
+			if (wsrep_handle->trx_id != WSREP_UNDEFINED_TRX_ID)
+			{
+				rcode = wsrep->abort_pre_commit(
+						wsrep, arg->bf_seqno,
+						(wsrep_trx_id_t)wsrep_handle->trx_id);
+
+				switch (rcode) {
+				case WSREP_WARNING:
+					WSREP_DEBUG("cancel commit warning: "
+						    TRX_ID_FMT,
+						    victim_trx->id);
+					goto ret_awake;
+				case WSREP_OK:
+					break;
+				case WSREP_TRX_MISSING:
+				case WSREP_TRX_FAIL:
+				case WSREP_BF_ABORT:
+					WSREP_DEBUG("calcel commit trx: "
+						    "rcode %d wsrep_trx_id %ld trx: "
+						    TRX_ID_FMT,
+						    rcode,
+						    wsrep_handle->trx_id,
+						    victim_trx->id);
+					break;
+				default:
+					WSREP_ERROR(
+						"cancel commit bad exit: %d "
+						TRX_ID_FMT,
+						rcode, victim_trx->id);
+					/* unable to interrupt, must abort */
+					/* note: kill_mysql() will block, if we cannot.
+					* kill the lock holder first.
+					*/
+				}
 			}
 		}
 		goto ret_awake;
