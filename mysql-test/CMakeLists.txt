@@ -23,6 +23,11 @@ IF(NOT ${CMAKE_SOURCE_DIR} STREQUAL ${CMAKE_BINARY_DIR})
     ${CMAKE_CURRENT_BINARY_DIR}/mariadb-test-run.pl
     @ONLY
   )
+  CONFIGURE_FILE(
+    ${CMAKE_CURRENT_SOURCE_DIR}/mariadb-stress-test.pl
+    ${CMAKE_CURRENT_BINARY_DIR}/mariadb-stress-test.pl
+    @ONLY
+  )
   IF(WIN32)
     CONFIGURE_FILE(
       ${CMAKE_CURRENT_SOURCE_DIR}/mtr.out-of-source
@@ -34,6 +39,10 @@ ELSEIF(WIN32)
   CONFIGURE_FILE(
     ${CMAKE_CURRENT_SOURCE_DIR}/mariadb-test-run.pl
     ${CMAKE_CURRENT_BINARY_DIR}/mysql-test-run.pl
+    COPYONLY)
+    CONFIGURE_FILE(
+    ${CMAKE_CURRENT_SOURCE_DIR}/mariadb-stress-test.pl
+    ${CMAKE_CURRENT_BINARY_DIR}/mysql-stress-test.pl
     COPYONLY)
 ENDIF()
 
@@ -53,10 +62,20 @@ IF(UNIX)
         COMPONENT Test)
     ENDIF()
   ENDFOREACH()
+  EXECUTE_PROCESS(
+    COMMAND chmod +x mariadb-stress-test.pl
+    COMMAND ${CMAKE_COMMAND} -E create_symlink
+    ./mariadb-stress-test.pl mysql-stress-tess.pl
+    WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
+  )
 ELSE()
   IF(INSTALL_MYSQLTESTDIR)
     INSTALL(FILES ${CMAKE_CURRENT_SOURCE_DIR}/mariadb-test-run.pl
       RENAME mysql-test-run.pl
+      DESTINATION ${INSTALL_MYSQLTESTDIR}
+      COMPONENT Test)
+    INSTALL(FILES ${CMAKE_CURRENT_SOURCE_DIR}/mariadb-stress-test.pl
+      RENAME mysql-stress-test.pl
       DESTINATION ${INSTALL_MYSQLTESTDIR}
       COMPONENT Test)
   ENDIF()
